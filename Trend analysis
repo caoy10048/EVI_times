@@ -1,0 +1,168 @@
+
+var VI=ee.ImageCollection("MODIS/061/MOD13A1")
+var CC=ee.ImageCollection("MODIS/061/MOD15A2H")
+var MOD_GPP=ee.ImageCollection("MODIS/061/MOD17A3HGF")
+var Region = ee.FeatureCollection("projects/pagreening10048/assets/Region/Region_10")
+var lc = ee.ImageCollection("MODIS/061/MCD12Q1")
+
+
+var IGBP=lc.select('LC_Type1')
+
+var vegetation=IGBP.map(function(img){
+  return img.updateMask(img.lte(12).or(img.eq(14))).clamp(0,1).set('system:time_start',img.get('system:time_start'))
+})
+var VT_mask=vegetation.max()
+
+
+function eeCdf(z) {
+  return ee.Image(0.5)
+      .multiply(ee.Image(1).add(ee.Image(z).divide(ee.Image(2).sqrt()).erf()));
+}
+function invCdf(p) {
+  return ee.Image(2).sqrt()
+      .multiply(ee.Image(p).multiply(2).subtract(1).erfInv());
+}
+
+var GPP=MOD_GPP.select('Gpp')
+var EVI=VI.select('EVI')
+var LAI=CC.select('Lai_500m')
+
+var VT_col=LAI
+var years = ee.List.sequence(2001, 2022);
+
+
+
+var list=Region.toList(306)
+
+for(var i=0;i<306;i++){
+var geo=ee.Feature(list.get(i))
+var roi=geo.geometry()
+
+var col = ee.ImageCollection(years
+  .map(function(y) {
+    var start = ee.Date.fromYMD(y, 1, 1);
+    var end = start.advance(1, 'year');
+    var imgs=VT_col.filterDate(start,end)
+  return imgs.median().clip(roi).multiply(100).set('system:time_start',imgs.first().get('system:time_start'))
+}));
+
+var afterFilter = ee.Filter.lessThan({
+  leftField: 'system:time_start',
+  rightField: 'system:time_start'
+});
+
+var joined = ee.ImageCollection(ee.Join.saveAll('after').apply({
+  primary: col,
+  secondary: col,
+  condition: afterFilter
+}));
+
+var sign = function(i, j) { // i and j are images
+  return ee.Image(j).neq(i) // Zero case
+      .multiply(ee.Image(j).subtract(i).clamp(-1, 1)).int();
+};
+
+var kendall = ee.ImageCollection(joined.map(function(current) {
+  var afterCollection = ee.ImageCollection.fromImages(current.get('after'));
+  return afterCollection.map(function(image) {
+    // The unmask is to prevent accumulation of masked pixels that
+    // result from the undefined case of when either current or image
+    // is masked.  It won't affect the sum, since it's unmasked to zero.
+    return ee.Image(sign(current, image)).unmask(0);
+  });
+  // Set parallelScale to avoid User memory limit exceeded.
+}).flatten()).reduce('sum', 2);
+
+//
+var slope = function(i, j) { // i and j are images
+  return ee.Image(j).subtract(i)
+      .divide(ee.Image(j).date().difference(ee.Image(i).date(), 'days'))
+      .rename('slope')
+      .float();
+};
+
+var slopes = ee.ImageCollection(joined.map(function(current) {
+  var afterCollection = ee.ImageCollection.fromImages(current.get('after'));
+  return afterCollection.map(function(image) {
+      return ee.Image(slope(current, image));
+  });
+}).flatten());
+
+var sensSlope = slopes.reduce(ee.Reducer.median(), 2); // Set parallelScale.
+
+
+// Values that are in a group (ties).  Set all else to zero.
+var groups = col.map(function(i) {
+  var matches = col.map(function(j) {
+    return i.eq(j); // i and j are images.
+  }).sum();
+  return i.multiply(matches.gt(1));
+});
+
+// Compute tie group sizes in a sequence.  The first group is discarded.
+var group = function(array) {
+  var length = array.arrayLength(0);
+  // Array of indices.  These are 1-indexed.
+  var indices = ee.Image([1])
+      .arrayRepeat(0, length)
+      .arrayAccum(0, ee.Reducer.sum())
+      .toArray(1);
+  var sorted = array.arraySort();
+  var left = sorted.arraySlice(0, 1);
+  var right = sorted.arraySlice(0, 0, -1);
+  // Indices of the end of runs.
+  var mask = left.neq(right)
+  // Always keep the last index, the end of the sequence.
+      .arrayCat(ee.Image(ee.Array([[1]])), 0);
+  var runIndices = indices.arrayMask(mask);
+  // Subtract the indices to get run lengths.
+  var groupSizes = runIndices.arraySlice(0, 1)
+      .subtract(runIndices.arraySlice(0, 0, -1));
+  return groupSizes;
+};
+
+// See equation 2.6 in Sen (1968).
+var factors = function(image) {
+  return image.expression('b() * (b() - 1) * (b() * 2 + 5)');
+};
+
+var groupSizes = group(groups.toArray());
+var groupFactors = factors(groupSizes);
+var groupFactorSum = groupFactors.arrayReduce('sum', [0])
+      .arrayGet([0, 0]);
+
+var count = joined.count();
+var kendallVariance = factors(count)
+    .subtract(groupFactorSum)
+    .divide(18)
+    .float();
+
+
+// Compute Z-statistics.
+var zero = kendall.multiply(kendall.eq(0));
+var pos = kendall.multiply(kendall.gt(0)).subtract(1);
+var neg = kendall.multiply(kendall.lt(0)).add(1);
+
+var z = zero
+    .add(pos.divide(kendallVariance.sqrt()))
+    .add(neg.divide(kendallVariance.sqrt()));
+
+
+// Compute P-values.
+var p = ee.Image(1).subtract(eeCdf(z.abs()));
+
+var significant=p.lte(0.05)
+
+
+var slope=sensSlope.updateMask(significant.gt(0)).updateMask(VT_mask).multiply(10000).toInt32()
+
+Export.image.toDrive({
+		image:slope,
+	description:'Year_LAI_'+i,
+	folder:'PAs_LAI_Year',
+	region:roi,
+	scale:500,
+	maxPixels:1e13,
+})
+}
+
